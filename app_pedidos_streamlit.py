@@ -13,7 +13,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 st.set_page_config(page_title="Pedidos Regional → ERON → Moléculas", page_icon="🛒", layout="wide")
 st.title("🛒 Pedidos por Regional → ERON → Moléculas")
 
-# =================== DB ===================
+# =================== DB & HELPERS ===================
 def get_conn():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -142,7 +142,6 @@ def ensure_seed(conn):
                                 int(row.activo) if pd.notna(row.activo) else 1)
 
 def get_or_create_pedido(conn, usuario: str, regional_nombre: str, eron_nombre: str, pedido_id: str|None=None):
-    # resolve ids
     rid = get_regional_id(conn, regional_nombre)
     if rid is None:
         rid = upsert_regional(conn, regional_nombre)
@@ -170,6 +169,22 @@ def list_pedidos(conn, limit=50):
     FROM pedido p
     JOIN regional r ON r.id=p.regional_id
     JOIN eron e ON e.id=p.eron_id
+    ORDER BY p.creado_en DESC
+    LIMIT ?
+    """
+    return pd.read_sql_query(q, conn, params=(limit,))
+
+def list_pedidos_with_stats(conn, limit=200):
+    q = """
+    SELECT p.id, p.creado_en, IFNULL(p.usuario,'') as usuario,
+           r.nombre as regional, e.nombre as eron, p.estado,
+           COALESCE(COUNT(pi.id),0) as items,
+           COALESCE(SUM(pi.cantidad),0) as total_cant
+    FROM pedido p
+    JOIN regional r ON r.id=p.regional_id
+    JOIN eron e ON e.id=p.eron_id
+    LEFT JOIN pedido_item pi ON pi.pedido_id = p.id
+    GROUP BY p.id, p.creado_en, p.usuario, r.nombre, e.nombre, p.estado
     ORDER BY p.creado_en DESC
     LIMIT ?
     """
@@ -218,6 +233,25 @@ def export_pedido(conn, pedido_id: str) -> pd.DataFrame:
     """
     return pd.read_sql_query(q, conn, params=(pedido_id,))
 
+def export_consolidado(conn, pedido_ids):
+    if not pedido_ids:
+        return pd.DataFrame()
+    placeholders = ",".join(["?"]*len(pedido_ids))
+    q = f"""
+    SELECT p.id as order_id, p.creado_en, p.usuario,
+           r.nombre as regional, e.nombre as eron,
+           m.codigo, m.nombre, m.unidad_presentacion,
+           pi.cantidad
+    FROM pedido p
+    JOIN regional r ON r.id=p.regional_id
+    JOIN eron e ON e.id=p.eron_id
+    JOIN pedido_item pi ON pi.pedido_id=p.id
+    JOIN molecula m ON m.id=pi.molecula_id
+    WHERE p.id IN ({placeholders})
+    ORDER BY regional, eron, m.nombre
+    """
+    return pd.read_sql_query(q, conn, params=tuple(pedido_ids))
+
 # =================== INIT ===================
 conn = get_conn()
 init_db(conn)
@@ -233,11 +267,10 @@ with st.sidebar:
     st.session_state["usuario"] = usuario
 
 # =================== Main Tabs ===================
-tab_pedido, tab_catalogos = st.tabs(["📝 Crear/Editar Pedido", "🗂️ Catálogos"])
+tab_pedido, tab_catalogos, tab_consolidado = st.tabs(["📝 Crear/Editar Pedido", "🗂️ Catálogos", "📦 Consolidado"])
 
 with tab_pedido:
     colA, colB = st.columns(2)
-    # Regional → ERON
     regionales = list_regionales(conn)
     regional = colA.selectbox("Regional", regionales, index=0 if regionales else None, placeholder="Selecciona...")
     erones = list_eron_by_regional(conn, regional) if regional else []
@@ -256,7 +289,6 @@ with tab_pedido:
     pid = st.session_state.get("pedido_id")
     if pid:
         st.success(f"Pedido activo: {pid}")
-        # Buscador de moléculas
         st.subheader("🔎 Buscar y agregar moléculas")
         q = st.text_input("Buscar por código o nombre", value=st.session_state.get("q",""))
         st.session_state["q"] = q
@@ -264,7 +296,6 @@ with tab_pedido:
         if resultados.empty:
             st.warning("Sin resultados.")
         else:
-            # Agregar cantidades
             st.caption("Escribe una cantidad y pulsa **Agregar/Actualizar** para cada ítem.")
             for i, row in resultados.iterrows():
                 with st.expander(f"{row['nombre']} — [{row['codigo']}] ({row['unidad_presentacion']})", expanded=False):
@@ -275,7 +306,6 @@ with tab_pedido:
                         st.toast("Guardado", icon="💾")
                         st.rerun()
 
-        # Carrito
         st.subheader("🛒 Carrito del pedido")
         items = load_pedido_items(conn, pid)
         if items.empty:
@@ -294,7 +324,6 @@ with tab_pedido:
                 hide_index=True,
                 key="carrito_editor",
             )
-            # Detect changes vs DB and persist
             merged = items.merge(edit_df[["item_id","cantidad"]], on="item_id", suffixes=("","_new"))
             for _, r in merged.iterrows():
                 if float(r["cantidad_new"]) != float(r["cantidad"]):
@@ -302,7 +331,7 @@ with tab_pedido:
                         delete_item(conn, int(r["item_id"]))
                     else:
                         add_or_update_item(conn, pid, int(r["molecula_id"]), float(r["cantidad_new"]))
-            # Botones eliminar por fila
+
             del_cols = st.columns(len(items))
             for idx, (_, r) in enumerate(items.iterrows()):
                 if del_cols[idx].button(f"🗑️ {r['codigo']}", key=f"del_{r['item_id']}"):
@@ -310,7 +339,6 @@ with tab_pedido:
                     st.toast("Ítem eliminado", icon="🗑️")
                     st.rerun()
 
-            # Export
             st.subheader("⬇️ Exportar")
             dfexp = export_pedido(conn, pid)
             csv_bytes = dfexp.to_csv(index=False).encode("utf-8")
@@ -342,7 +370,6 @@ with tab_catalogos:
 
     if up_mol:
         df = read_any(up_mol)
-        # normalizar columnas
         tmp = df.copy()
         tmp.columns = [str(c).strip().lower() for c in tmp.columns]
         need = {"codigo","nombre","unidad_presentacion"}
@@ -351,7 +378,6 @@ with tab_catalogos:
         else:
             tmp["activo"] = tmp.get("activo", 1)
             tmp.to_csv(DATA_DIR/"sample_catalogos.csv", index=False, encoding="utf-8")
-            # re-seed moleculas (upsert)
             for row in tmp.itertuples(index=False):
                 upsert_molecula(conn,
                                 str(getattr(row,'codigo')).strip(),
@@ -369,8 +395,36 @@ with tab_catalogos:
             st.error(f"Faltan columnas {need - set(tmp.columns)}")
         else:
             tmp.to_csv(DATA_DIR/"sample_regionales_eron.csv", index=False, encoding="utf-8")
-            # actualizar tablas regional/eron
             for r,e in tmp[["regional","eron"]].itertuples(index=False):
                 rid = upsert_regional(conn, str(r).strip())
                 upsert_eron(conn, str(e).strip(), rid)
             st.success("Mapa Regional↔ERON actualizado.")
+
+with tab_consolidado:
+    st.subheader("📦 Exportar consolidado de múltiples pedidos")
+    st.caption("Selecciona uno o varios pedidos (de distintas Regionales/ERON) y exporta todo junto.")
+    dfp = list_pedidos_with_stats(conn, limit=500)
+    if dfp.empty:
+        st.info("Aún no hay pedidos.")
+    else:
+        st.dataframe(dfp, use_container_width=True, hide_index=True)
+        opciones = dfp.apply(lambda r: f"{r['id']} | {r['regional']} → {r['eron']} | {r['creado_en']} | ítems: {int(r['items'])}", axis=1).tolist()
+        id_by_label = {label: dfp.iloc[i]["id"] for i, label in enumerate(opciones)}
+        elegir = st.multiselect("Selecciona pedidos", opciones, default=[])
+        sel_ids = [id_by_label[o] for o in elegir]
+        if sel_ids:
+            dfc = export_consolidado(conn, sel_ids)
+            if dfc.empty:
+                st.warning("Los pedidos seleccionados no tienen ítems.")
+            else:
+                st.success(f"{len(sel_ids)} pedidos seleccionados — {len(dfc)} renglones.")
+                csv_bytes = dfc.to_csv(index=False).encode("utf-8")
+                xlsx_io = io.BytesIO()
+                with pd.ExcelWriter(xlsx_io, engine="xlsxwriter") as writer:
+                    dfc.to_excel(writer, index=False, sheet_name="consolidado")
+                xlsx_io.seek(0)
+                st.download_button("⬇️ CSV consolidado", csv_bytes, file_name="pedidos_consolidado.csv", mime="text/csv")
+                st.download_button("⬇️ Excel consolidado (.xlsx)", xlsx_io, file_name="pedidos_consolidado.xlsx",
+                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        else:
+            st.info("Selecciona al menos un pedido para habilitar la exportación.")
